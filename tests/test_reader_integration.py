@@ -4,20 +4,34 @@ import threading
 import pytest
 
 from reader import USER_AGENT
+from reader import ParseError
+from reader import StorageError
+from reader._types import FeedFilter
 from utils import make_url_base
 from utils import utc_datetime
 
 
 @pytest.fixture
-def server(request):
-    server = HTTPServer(('127.0.0.1', 0))
-    thread = threading.Thread(target=server.serve_forever, args=(0.005,))
-    thread.start()
-    try:
-        yield server
-    finally:
+def server_factory(request):
+    servers = []
+
+    def factory():
+        server = HTTPServer(('127.0.0.1', 0))
+        thread = threading.Thread(target=server.serve_forever, args=(0.005,))
+        thread.start()
+        servers.append((server, thread))
+        return server
+
+    yield factory
+
+    for server, thread in servers:
         server.shutdown()
         thread.join()
+
+
+@pytest.fixture
+def server(server_factory):
+    return server_factory()
 
 
 class HTTPServer(socketserver.TCPServer):
@@ -205,3 +219,317 @@ def test_cache_control(reader, data_dir, server, monkeypatch_datetime):
 
     datetime.now.set(datetime(2010, 1, 2, 13))
     assert update() == {server.url}
+
+
+def get_persisted_caching_info(reader, url):
+    """The ETag / Last-Modified validators stored for a feed, as a dict."""
+    (feed_for_update,) = reader._storage.get_feeds_for_update(FeedFilter(url))
+    return feed_for_update.caching_info
+
+
+def get_entry_count(reader, url):
+    return len(list(reader.get_entries(feed=url)))
+
+
+@pytest.mark.slow
+@pytest.mark.noscheduled
+def test_conditional_requests_update_chain(reader, data_dir, server):
+    """End-to-end consistency of conditional requests along a full update chain:
+    first 200, then 304, then validator change, then a server that ignores
+    the conditional headers. At every step, check the request headers on
+    the wire, entry de-duplication, and the persisted validator version.
+
+    """
+    etag_one = b'"00000-67890abcdef12"'
+    last_modified_one = b'Thu, 1 Jan 2020 00:00:00 GMT'
+    caching_info_one = {
+        'etag': etag_one.decode(),
+        'last-modified': last_modified_one.decode(),
+    }
+    etag_two = b'"11111-67890abcdef12"'
+    last_modified_two = b'Thu, 1 Jan 2020 11:11:11 GMT'
+    caching_info_two = {
+        'etag': etag_two.decode(),
+        'last-modified': last_modified_two.decode(),
+    }
+
+    reader.add_feed(server.url)
+    assert get_persisted_caching_info(reader, server.url) is None
+
+    # first update: 200, no validators to send yet
+    server.set_response(
+        data_dir.joinpath('full.atom').read_text(),
+        ETag=etag_one,
+        Last_Modified=last_modified_one,
+    )
+    assert reader.update_feed(server.url).new == 5
+    _, headers, _ = server.request
+    assert b'If-None-Match' not in headers
+    assert b'If-Modified-Since' not in headers
+    assert get_persisted_caching_info(reader, server.url) == caching_info_one
+    assert get_entry_count(reader, server.url) == 5
+
+    # second update: 304, first validators are sent back and stay persisted
+    server.set_response(status='304 Not Modified')
+    assert reader.update_feed(server.url) is None
+    _, headers, _ = server.request
+    assert headers[b'If-None-Match'] == etag_one
+    assert headers[b'If-Modified-Since'] == last_modified_one
+    assert get_persisted_caching_info(reader, server.url) == caching_info_one
+    assert get_entry_count(reader, server.url) == 5
+
+    # third update: 200 with changed validators;
+    # the old ones are sent on the wire, the new ones get persisted
+    server.set_response(
+        data_dir.joinpath('empty.atom').read_text(),
+        ETag=etag_two,
+        Last_Modified=last_modified_two,
+    )
+    assert reader.update_feed(server.url).new == 0
+    _, headers, _ = server.request
+    assert headers[b'If-None-Match'] == etag_one
+    assert headers[b'If-Modified-Since'] == last_modified_one
+    assert get_persisted_caching_info(reader, server.url) == caching_info_two
+    assert get_entry_count(reader, server.url) == 5
+
+    # fourth update: the server ignores the conditional request headers
+    # and responds 200 with the same body and validators;
+    # entries are de-duplicated and the validators are kept
+    assert reader.update_feed(server.url).new == 0
+    _, headers, _ = server.request
+    assert headers[b'If-None-Match'] == etag_two
+    assert headers[b'If-Modified-Since'] == last_modified_two
+    assert get_persisted_caching_info(reader, server.url) == caching_info_two
+    assert get_entry_count(reader, server.url) == 5
+
+    # fifth update: 304, the changed validators are still in use
+    server.set_response(status='304 Not Modified')
+    assert reader.update_feed(server.url) is None
+    _, headers, _ = server.request
+    assert headers[b'If-None-Match'] == etag_two
+    assert headers[b'If-Modified-Since'] == last_modified_two
+    assert get_persisted_caching_info(reader, server.url) == caching_info_two
+    assert get_entry_count(reader, server.url) == 5
+
+
+@pytest.mark.slow
+@pytest.mark.noscheduled
+def test_conditional_requests_parse_error_keeps_state(reader, data_dir, server):
+    """A failed update must not clobber the persisted validators nor
+    the already stored entries; the next request re-sends the old validators.
+
+    """
+    etag = b'"00000-67890abcdef12"'
+    last_modified = b'Thu, 1 Jan 2020 00:00:00 GMT'
+    caching_info = {
+        'etag': etag.decode(),
+        'last-modified': last_modified.decode(),
+    }
+
+    reader.add_feed(server.url)
+
+    server.set_response(
+        data_dir.joinpath('full.atom').read_text(),
+        ETag=etag,
+        Last_Modified=last_modified,
+    )
+    assert reader.update_feed(server.url).new == 5
+    assert get_persisted_caching_info(reader, server.url) == caching_info
+
+    # the server responds 200 with a body that cannot be parsed
+    # and new validators; the update fails
+    server.set_response(
+        b'this is not a feed',
+        ETag=b'"11111-67890abcdef12"',
+        Last_Modified=b'Thu, 1 Jan 2020 11:11:11 GMT',
+    )
+    with pytest.raises(ParseError):
+        reader.update_feed(server.url)
+    _, headers, _ = server.request
+    assert headers[b'If-None-Match'] == etag
+    assert headers[b'If-Modified-Since'] == last_modified
+
+    # the old validators and the stored entries are untouched
+    assert get_persisted_caching_info(reader, server.url) == caching_info
+    assert get_entry_count(reader, server.url) == 5
+    assert reader.get_feed(server.url).last_exception is not None
+
+    # the next request re-sends the old validators, not the new ones
+    server.set_response(status='304 Not Modified')
+    assert reader.update_feed(server.url) is None
+    _, headers, _ = server.request
+    assert headers[b'If-None-Match'] == etag
+    assert headers[b'If-Modified-Since'] == last_modified
+    assert get_persisted_caching_info(reader, server.url) == caching_info
+    assert get_entry_count(reader, server.url) == 5
+
+
+@pytest.mark.slow
+@pytest.mark.noscheduled
+def test_conditional_requests_storage_error_keeps_state(
+    reader, data_dir, server, monkeypatch
+):
+    """If storing the update fails, the old validators are still sent
+    on the next request, and entries already saved are de-duplicated
+    when the server re-sends them.
+
+    """
+    etag_one = b'"00000-67890abcdef12"'
+    last_modified_one = b'Thu, 1 Jan 2020 00:00:00 GMT'
+    caching_info_one = {
+        'etag': etag_one.decode(),
+        'last-modified': last_modified_one.decode(),
+    }
+    etag_two = b'"11111-67890abcdef12"'
+    last_modified_two = b'Thu, 1 Jan 2020 11:11:11 GMT'
+    caching_info_two = {
+        'etag': etag_two.decode(),
+        'last-modified': last_modified_two.decode(),
+    }
+
+    reader.add_feed(server.url)
+
+    server.set_response(
+        data_dir.joinpath('full.atom').read_text(),
+        ETag=etag_one,
+        Last_Modified=last_modified_one,
+    )
+    assert reader.update_feed(server.url).new == 5
+    assert get_persisted_caching_info(reader, server.url) == caching_info_one
+
+    # the feed gets a new entry and new validators,
+    # but storing the feed update fails
+    new_entry = """
+    <entry>
+        <title>New Entry</title>
+        <id>urn:uuid:new-entry</id>
+        <updated>2003-12-14T00:00:00Z</updated>
+    </entry>
+"""
+    full_atom = data_dir.joinpath('full.atom').read_text()
+    server.set_response(
+        full_atom.replace('</feed>', new_entry + '</feed>'),
+        ETag=etag_two,
+        Last_Modified=last_modified_two,
+    )
+
+    def failing_update_feed(intent):
+        raise StorageError('simulated storage failure')
+
+    monkeypatch.setattr(reader._storage, 'update_feed', failing_update_feed)
+    with pytest.raises(StorageError):
+        reader.update_feed(server.url)
+    monkeypatch.undo()
+
+    # the failed request carried the old validators
+    _, headers, _ = server.request
+    assert headers[b'If-None-Match'] == etag_one
+    assert headers[b'If-Modified-Since'] == last_modified_one
+
+    # the old validators are still persisted;
+    # entries are stored before the feed update, so the new entry
+    # made it to storage even though the update failed
+    assert get_persisted_caching_info(reader, server.url) == caching_info_one
+    assert get_entry_count(reader, server.url) == 6
+
+    # the retry re-sends the old validators, and the already stored
+    # entry is de-duplicated, not added again
+    assert reader.update_feed(server.url).new == 0
+    _, headers, _ = server.request
+    assert headers[b'If-None-Match'] == etag_one
+    assert headers[b'If-Modified-Since'] == last_modified_one
+    assert get_entry_count(reader, server.url) == 6
+
+    # the stored content is already up to date with the response,
+    # so the new validators are not persisted yet
+    assert get_persisted_caching_info(reader, server.url) == caching_info_one
+
+    # once the feed content changes again,
+    # the new validators finally get persisted
+    another_entry = """
+    <entry>
+        <title>Another New Entry</title>
+        <id>urn:uuid:another-new-entry</id>
+        <updated>2003-12-15T00:00:00Z</updated>
+    </entry>
+"""
+    server.set_response(
+        full_atom.replace('</feed>', new_entry + another_entry + '</feed>'),
+        ETag=etag_two,
+        Last_Modified=last_modified_two,
+    )
+    assert reader.update_feed(server.url).new == 1
+    _, headers, _ = server.request
+    assert headers[b'If-None-Match'] == etag_one
+    assert headers[b'If-Modified-Since'] == last_modified_one
+    assert get_persisted_caching_info(reader, server.url) == caching_info_two
+    assert get_entry_count(reader, server.url) == 7
+
+
+@pytest.mark.slow
+@pytest.mark.noscheduled
+def test_conditional_requests_feeds_do_not_share_validators(
+    reader, data_dir, server_factory
+):
+    """Concurrent updates of different feeds must not mix up
+    their ETag / Last-Modified validators.
+
+    """
+    server_one = server_factory()
+    server_two = server_factory()
+
+    etag_one = b'"00000-67890abcdef12"'
+    last_modified_one = b'Thu, 1 Jan 2020 00:00:00 GMT'
+    etag_two = b'"11111-67890abcdef12"'
+    last_modified_two = b'Thu, 1 Jan 2020 11:11:11 GMT'
+
+    reader.add_feed(server_one.url)
+    reader.add_feed(server_two.url)
+
+    server_one.set_response(
+        data_dir.joinpath('full.atom').read_text(),
+        ETag=etag_one,
+        Last_Modified=last_modified_one,
+    )
+    server_two.set_response(
+        data_dir.joinpath('empty.atom').read_text(),
+        ETag=etag_two,
+        Last_Modified=last_modified_two,
+    )
+
+    results = dict(reader.update_feeds_iter(workers=2))
+    assert results[server_one.url].new == 5
+    assert results[server_two.url].new == 1
+    assert get_entry_count(reader, server_one.url) == 5
+    assert get_entry_count(reader, server_two.url) == 1
+
+    _, headers_one, _ = server_one.request
+    _, headers_two, _ = server_two.request
+    assert b'If-None-Match' not in headers_one
+    assert b'If-None-Match' not in headers_two
+
+    # each feed persists its own validators
+    assert get_persisted_caching_info(reader, server_one.url) == {
+        'etag': etag_one.decode(),
+        'last-modified': last_modified_one.decode(),
+    }
+    assert get_persisted_caching_info(reader, server_two.url) == {
+        'etag': etag_two.decode(),
+        'last-modified': last_modified_two.decode(),
+    }
+
+    # on the next round of concurrent updates,
+    # each feed sends back its own validators
+    server_one.set_response(status='304 Not Modified')
+    server_two.set_response(status='304 Not Modified')
+
+    results = dict(reader.update_feeds_iter(workers=2))
+    assert results[server_one.url] is None
+    assert results[server_two.url] is None
+
+    _, headers_one, _ = server_one.request
+    _, headers_two, _ = server_two.request
+    assert headers_one[b'If-None-Match'] == etag_one
+    assert headers_one[b'If-Modified-Since'] == last_modified_one
+    assert headers_two[b'If-None-Match'] == etag_two
+    assert headers_two[b'If-Modified-Since'] == last_modified_two
