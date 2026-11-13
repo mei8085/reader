@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from .._types import EntryFilter
 from .._types import EntryForUpdate
 from .._types import EntryUpdateIntent
+from .._types import UpdateCursor
 from .._utils import exactly_one
 from .._utils import zero_or_one
 from ..exceptions import EntryError
@@ -32,6 +33,7 @@ from ..types import EntrySort
 from ..types import EntrySource
 from ._base import wrap_exceptions
 from ._feeds import feed_factory
+from ._feeds import set_feed_update_cursor
 from ._sql_utils import Query
 from ._sql_utils import SortKey
 from ._sqlite_utils import adapt_datetime
@@ -223,34 +225,58 @@ class EntriesMixin(StorageBase):
 
     def _add_or_update_entry_dicts(self, intents: Iterable[EntryDict]) -> None:
         with self.get_db() as db:
-            try:
-                for intent in intents:
-                    # we cannot rely on the updater getting an EntryForUpdate
-                    # to tell if the entry is new at *this* point in time,
-                    # the entry may have been added/deleted by a parallel update
-                    #
-                    # as a consequence, EntryUpdateIntent must set all fields,
-                    # including the ones which have a single value
-                    # for the entire lifetime of the entry (like first_updated)
+            self._add_or_update_entry_dicts_db(db, intents)
 
-                    new = not list(
-                        db.execute(
-                            "SELECT 1 FROM entries WHERE (feed, id) = (?, ?)",
-                            (intent['feed'], intent['id']),
-                        )
+    def _add_or_update_entry_dicts_db(
+        self, db: sqlite3.Connection, intents: Iterable[EntryDict]
+    ) -> None:
+        try:
+            for intent in intents:
+                # we cannot rely on the updater getting an EntryForUpdate
+                # to tell if the entry is new at *this* point in time,
+                # the entry may have been added/deleted by a parallel update
+                #
+                # as a consequence, EntryUpdateIntent must set all fields,
+                # including the ones which have a single value
+                # for the entire lifetime of the entry (like first_updated)
+
+                new = not list(
+                    db.execute(
+                        "SELECT 1 FROM entries WHERE (feed, id) = (?, ?)",
+                        (intent['feed'], intent['id']),
                     )
+                )
 
-                    if new:
-                        self._insert_entry_dict(db, intent)
-                    else:
-                        self._update_entry_dict(db, intent)
+                if new:
+                    self._insert_entry_dict(db, intent)
+                else:
+                    self._update_entry_dict(db, intent)
 
-            except sqlite3.IntegrityError as e:
-                e_msg = str(e).lower()
-                if "foreign key constraint failed" in e_msg:
-                    assert isinstance(intent['feed'], str)
-                    raise FeedNotFoundError(intent['feed']) from None
-                raise  # pragma: no cover
+        except sqlite3.IntegrityError as e:
+            e_msg = str(e).lower()
+            if "foreign key constraint failed" in e_msg:
+                assert isinstance(intent['feed'], str)
+                raise FeedNotFoundError(intent['feed']) from None
+            raise  # pragma: no cover
+
+    @wrap_exceptions()
+    def add_or_update_entries_with_cursor(
+        self,
+        intents: Iterable[EntryUpdateIntent],
+        url: str,
+        cursor: UpdateCursor,
+    ) -> None:
+        """Add or update entries and advance the feed's update cursor,
+        in the same transaction.
+
+        Used to persist update progress
+        when the update cursor feature is enabled.
+
+        """
+        dicts = [entry_update_intent_to_dict(intent) for intent in intents]
+        with self.get_db() as db:
+            self._add_or_update_entry_dicts_db(db, dicts)
+            set_feed_update_cursor(db, url, cursor)
 
     def _insert_entry_dict(self, db: sqlite3.Connection, intent: EntryDict) -> None:
         query = """

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
+from itertools import batched
 from itertools import chain
 from typing import Any
 from typing import NamedTuple
@@ -22,6 +24,7 @@ from .._types import FeedData
 from .._types import FeedForUpdate
 from .._types import FeedToUpdate
 from .._types import FeedUpdateIntent
+from .._types import UpdateCursor
 from .._types import UpdateInfo
 from .._utils import make_pool_map
 from ..exceptions import ParseError
@@ -69,6 +72,10 @@ class Decider:
     global_now: datetime
     config: UpdateConfig
 
+    #: Whether to use the persistent update cursor
+    #: to resume interrupted updates.
+    use_update_cursor: bool = False
+
     @classmethod
     def process_feed_for_update(cls, feed: FeedForUpdate) -> FeedForUpdate:
         if feed.stale:
@@ -91,12 +98,14 @@ class Decider:
         config: UpdateConfig,
         result: ParseResult,
         entry_pairs: Iterable[EntryPair],
+        use_update_cursor: bool = False,
     ) -> tuple[FeedUpdateIntent, Iterable[EntryUpdateIntentPair]]:
         decider = cls(
             result.feed,
             now,
             global_now,
             config,
+            use_update_cursor,
         )
         return decider.update(result, entry_pairs)
 
@@ -193,9 +202,13 @@ class Decider:
         return None
 
     def get_entries_to_update(
-        self, pairs: Iterable[EntryPair]
+        self, pairs: Iterable[EntryPair], resume_from: int | None = None
     ) -> Iterable[EntryUpdateIntentPair]:
         for feed_order, (new, old) in reversed(list(enumerate(pairs))):
+            if resume_from is not None and feed_order >= resume_from:
+                # already stored by the interrupted update we're resuming
+                continue
+
             # This may fail if we ever implement changing the feed URL
             # in response to a permanent redirect.
             assert new.feed_url == self.url, f'{new.feed_url!r}, {self.url!r}'
@@ -237,6 +250,7 @@ class Decider:
         entries_to_update: list[EntryUpdateIntentPair] = []
         value: FeedToUpdate | None | ExceptionInfo
         info_result: UpdatedFeed | None | ExceptionInfo
+        update_token: bytes | None = None
 
         if not result.value:
             value = info_result = None
@@ -244,7 +258,21 @@ class Decider:
             value = ExceptionInfo.from_exception(result.value)
             info_result = value._replace(traceback_str='')
         else:
-            entries_to_update = list(self.get_entries_to_update(entry_pairs))
+            pairs = list(entry_pairs)
+
+            resume_from = None
+            if self.use_update_cursor:
+                update_token = make_update_token(result.value.feed, pairs)
+                cursor = self.old_feed.update_cursor
+                if cursor is not None and cursor.token == update_token:
+                    resume_from = cursor.feed_order
+                    logger.info(
+                        "resuming interrupted update",
+                        feed=self.url,
+                        feed_order=resume_from,
+                    )
+
+            entries_to_update = list(self.get_entries_to_update(pairs, resume_from))
             value = self.get_feed_to_update(result.value, bool(entries_to_update))
             info_result = make_updated_feed(result, entries_to_update)
 
@@ -273,9 +301,31 @@ class Decider:
         # and clear last_exception (if set before the update).
 
         return (
-            FeedUpdateIntent(self.url, self.now, update_after, update_history, value),
+            FeedUpdateIntent(
+                self.url,
+                self.now,
+                update_after,
+                update_history,
+                value,
+                update_token,
+            ),
             entries_to_update,
         )
+
+
+def make_update_token(feed: FeedData, pairs: Iterable[EntryPair]) -> bytes:
+    """A token identifying a parsed feed and its entry stream.
+
+    Used to tell if a persisted update cursor belongs to this parse;
+    if it does not, the cursor is ignored.
+
+    """
+    h = hashlib.md5(feed.hash)
+    for new, _ in pairs:
+        h.update(new.id.encode('utf-8'))
+        h.update(b'\0')
+        h.update(new.hash)
+    return h.digest()
 
 
 class UpdateReasons(NamedTuple):
@@ -416,14 +466,36 @@ class Pipeline(PipelineBase[FeedData, EntryData, FeedUpdateIntent, EntryUpdateIn
             config,
             result,
             entries,
+            use_update_cursor=self.use_update_cursor,
         )
 
     def store_feed(
         self, feed: FeedUpdateIntent, entries: Iterable[EntryUpdateIntent]
     ) -> None:
+        storage = self.reader._storage
+
+        if not self.use_update_cursor:
+            if entries:
+                storage.add_or_update_entries(entries)
+            storage.update_feed(feed)
+            return
+
+        # Write entries and advance the persistent update cursor
+        # in the same transaction, so that a retried update
+        # neither duplicates stored entries nor skips unstored ones.
+        # The final feed update clears the cursor,
+        # and is only applied if it does not overwrite
+        # the progress of a newer update.
+        entries = list(entries)
         if entries:
-            self.reader._storage.add_or_update_entries(entries)
-        self.reader._storage.update_feed(feed)
+            token = feed.update_token
+            assert token is not None, "update_token must be set to store entries"
+            chunk_size = storage.chunk_size
+            batches = batched(entries, chunk_size) if chunk_size else (entries,)
+            for batch in batches:
+                cursor = UpdateCursor(feed.last_retrieved, token, batch[-1].feed_order)
+                storage.add_or_update_entries_with_cursor(batch, feed.url, cursor)
+        storage.update_feed_and_clear_update_cursor(feed)
 
     def get_entry_resource_id(self, data: EntryData) -> tuple[str, str]:
         return data.resource_id

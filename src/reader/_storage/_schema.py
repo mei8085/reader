@@ -29,7 +29,8 @@ CREATE TABLE feeds (
     last_updated TIMESTAMP,  -- null if the feed was never updated
     added TIMESTAMP NOT NULL,
     last_exception TEXT,
-    update_history TEXT
+    update_history TEXT,
+    update_cursor TEXT  -- null unless an update is in progress
 
     -- NOTE: when adding new fields, check if they should be set
     -- to their default value in change_feed_url()
@@ -368,7 +369,12 @@ def update_from_44_to_45(db: sqlite3.Connection, /) -> None:  # pragma: no cover
     db.execute("ALTER TABLE feeds ADD COLUMN update_history TEXT;")
 
 
-VERSION = 45
+def update_from_45_to_46(db: sqlite3.Connection, /) -> None:  # pragma: no cover
+    # persistent progress cursor for feed updates
+    db.execute("ALTER TABLE feeds ADD COLUMN update_cursor TEXT;")
+
+
+VERSION = 46
 
 MIGRATIONS = {
     # 1-9 removed before 0.1 (last in e4769d8ba77c61ec1fe2fbe99839e1826c17ace7)
@@ -384,6 +390,7 @@ MIGRATIONS = {
     42: update_from_42_to_43,
     43: update_from_43_to_44,
     44: update_from_44_to_45,
+    45: update_from_45_to_46,
 }
 MISSING_SUFFIX = (
     "; you may have skipped some required migrations, see "

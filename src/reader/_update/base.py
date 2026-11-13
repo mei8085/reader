@@ -35,7 +35,7 @@ logger = get_logger('reader.update')
 
 
 type PipelineFactory = Callable[
-    [Reader, datetime, int, bool], PipelineBase[Any, Any, Any, Any]
+    [Reader, datetime, int, bool, bool], PipelineBase[Any, Any, Any, Any]
 ]
 type ParseResult[FD, ED] = ParseResultBase[FeedForUpdate, FD, ED, ParseError]
 type EntryPair[ED] = EntryPairBase[ED]
@@ -54,6 +54,7 @@ class PipelineBase[FD, ED, FI, EI](ABC):
     now: datetime
     workers: int
     call_feeds_hooks: bool
+    use_update_cursor: bool = False
 
     @abstractmethod
     def parse_feeds(

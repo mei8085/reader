@@ -219,6 +219,9 @@ Data objects
 .. autoclass:: FeedForUpdate
     :members:
 
+.. autoclass:: UpdateCursor
+    :members:
+
 .. autoclass:: EntryForUpdate
     :members:
 

@@ -1300,3 +1300,224 @@ def test_update_history_limit(reader, parser):
 
 
 # END: update_history
+
+
+# BEGIN: update cursor
+
+
+def get_update_cursor(reader):
+    return (
+        reader._storage.get_db()
+        .execute("SELECT update_cursor FROM feeds;")
+        .fetchone()[0]
+    )
+
+
+def make_failing_storage(reader, monkeypatch, fail_on_call):
+    """Make add_or_update_entries_with_cursor fail on the fail_on_call-th call."""
+    original = reader._storage.add_or_update_entries_with_cursor
+    calls = []
+
+    def wrapper(intents, url, cursor):
+        calls.append(cursor)
+        if len(calls) == fail_on_call:
+            raise StorageError("storage failed")
+        return original(intents, url, cursor)
+
+    monkeypatch.setattr(reader._storage, 'add_or_update_entries_with_cursor', wrapper)
+    return calls
+
+
+def test_update_cursor_not_used_by_default(reader, parser, update_feed):
+    """Existing update calls do not use the update cursor."""
+    feed = parser.feed(1, datetime(2010, 1, 1))
+    parser.entry(1, 1, datetime(2010, 1, 1))
+    reader.add_feed(feed.url)
+
+    update_feed(reader, feed.url)
+
+    assert get_update_cursor(reader) is None
+
+
+def test_update_cursor_cleared_after_update(reader, parser):
+    feed = parser.feed(1, datetime(2010, 1, 1))
+    for i in range(1, 4):
+        parser.entry(1, i, datetime(2010, 1, 1))
+    reader.add_feed(feed.url)
+
+    reader._storage.chunk_size = 2
+    reader.update_feed(feed.url, use_update_cursor=True)
+
+    assert get_update_cursor(reader) is None
+    assert len(list(reader.get_entries())) == 3
+
+
+def test_update_cursor_resume(reader, parser, monkeypatch):
+    """A retried update resumes from the persisted cursor:
+    entries stored before the interruption are not stored again,
+    entries that were not stored are not skipped.
+
+    """
+    feed = parser.feed(1, datetime(2010, 1, 1))
+    for i in range(1, 6):
+        parser.entry(1, i, datetime(2010, 1, 1))
+    reader.add_feed(feed.url)
+
+    reader._now = lambda: datetime(2010, 1, 1)
+    reader.update_feed(feed.url, use_update_cursor=True)
+    assert get_update_cursor(reader) is None
+
+    # force all entries to be updated again
+    reader._storage.set_feed_stale(feed.url, True)
+    reader._storage.chunk_size = 2
+
+    make_failing_storage(reader, monkeypatch, fail_on_call=2)
+
+    reader._now = lambda: datetime(2010, 1, 2)
+    with pytest.raises(StorageError):
+        reader.update_feed(feed.url, use_update_cursor=True)
+
+    # the first batch of entries was stored,
+    # along with the cursor, in the same transaction
+    assert get_update_cursor(reader) is not None
+    stored = {
+        e.id: e.last_updated
+        for e in reader.get_entries()
+        if e.last_updated == datetime(2010, 1, 2)
+    }
+    assert len(stored) == 2
+
+    monkeypatch.undo()
+
+    reader._now = lambda: datetime(2010, 1, 3)
+    reader.update_feed(feed.url, use_update_cursor=True)
+
+    # the cursor was cleared
+    assert get_update_cursor(reader) is None
+
+    # no entry was skipped
+    entries = {e.id: e for e in reader.get_entries()}
+    assert len(entries) == 5
+
+    # entries stored before the interruption were not stored again
+    for id, last_updated in stored.items():
+        assert entries[id].last_updated == last_updated
+
+    # entries that were not stored were stored now
+    assert {e.last_updated for id, e in entries.items() if id not in stored} == {
+        datetime(2010, 1, 3)
+    }
+
+
+def test_update_cursor_resume_changed_feed(reader, parser, monkeypatch):
+    """If the feed changes after an interrupted update,
+    the persisted cursor is ignored."""
+    feed = parser.feed(1, datetime(2010, 1, 1))
+    for i in range(1, 4):
+        parser.entry(1, i, datetime(2010, 1, 1))
+    reader.add_feed(feed.url)
+
+    reader._now = lambda: datetime(2010, 1, 1)
+    reader.update_feed(feed.url, use_update_cursor=True)
+
+    reader._storage.set_feed_stale(feed.url, True)
+    reader._storage.chunk_size = 2
+
+    make_failing_storage(reader, monkeypatch, fail_on_call=2)
+
+    reader._now = lambda: datetime(2010, 1, 2)
+    with pytest.raises(StorageError):
+        reader.update_feed(feed.url, use_update_cursor=True)
+
+    assert get_update_cursor(reader) is not None
+    stored = {e.id for e in reader.get_entries()}
+
+    monkeypatch.undo()
+
+    # the feed changes before the retry
+    parser.entry(1, 1, datetime(2010, 1, 1), title='changed')
+    parser.entry(1, 4, datetime(2010, 1, 1))
+
+    reader._now = lambda: datetime(2010, 1, 3)
+    reader.update_feed(feed.url, use_update_cursor=True)
+
+    assert get_update_cursor(reader) is None
+
+    entries = {e.id: e for e in reader.get_entries()}
+    assert len(entries) == 4
+    # all entries were updated, including those stored before the interruption
+    assert {e.last_updated for e in entries.values()} == {datetime(2010, 1, 3)}
+    assert stored < set(entries)
+
+
+@pytest.mark.slow
+def test_update_cursor_concurrent_old_does_not_overwrite(
+    monkeypatch, db_path, make_reader, parser
+):
+    """A concurrent update started earlier must not overwrite
+    the progress of a newer one."""
+    reader = make_reader(db_path)
+
+    reader.add_feed(parser.feed(1))
+    parser.entry(1, 1, title='one')
+    reader._now = lambda: datetime(2010, 1, 1)
+    reader.update_feeds(use_update_cursor=True)
+
+    block = Blocking()
+
+    def target():
+        # the newer update runs to completion first
+        with block:
+            reader = make_reader(db_path)
+            reader._parser = parser.copy()
+            reader._parser.entry(1, 1, title='two')
+            reader._now = lambda: datetime(2010, 1, 1, 2)
+            reader.update_feeds(use_update_cursor=True)
+
+    from reader._update import Pipeline
+
+    def store_feed(*args, **kwargs):
+        # pause the older update right before storing
+        monkeypatch.undo()
+        block()
+        return Pipeline.store_feed(*args, **kwargs)
+
+    monkeypatch.setattr(Pipeline, 'store_feed', store_feed)
+
+    t = threading.Thread(target=target)
+    t.start()
+    try:
+        reader._now = lambda: datetime(2010, 1, 1, 1)
+        reader.update_feeds(use_update_cursor=True)
+    finally:
+        t.join()
+
+    # the older update did not overwrite the newer one's progress
+    feed = reader.get_feed('1')
+    assert feed.last_updated == datetime(2010, 1, 1, 2)
+    assert feed.last_retrieved == datetime(2010, 1, 1, 2)
+
+
+def test_update_cursor_not_modified_does_not_overwrite(reader, parser):
+    """A stale not-modified response must not overwrite newer progress."""
+    feed = parser.feed(1, datetime(2010, 1, 1))
+    parser.entry(1, 1, datetime(2010, 1, 1))
+    reader.add_feed(feed.url)
+
+    reader._now = lambda: datetime(2010, 1, 2)
+    reader.update_feed(feed.url, use_update_cursor=True)
+
+    # simulate an older not-modified result committing after a newer update
+    from reader._types import FeedUpdateIntent
+
+    old_intent = FeedUpdateIntent(
+        feed.url, datetime(2010, 1, 1), datetime(2010, 1, 1), [], None
+    )
+    reader._storage.update_feed_and_clear_update_cursor(old_intent)
+
+    feed = reader.get_feed('1')
+    assert feed.last_updated == datetime(2010, 1, 2)
+    assert feed.last_retrieved == datetime(2010, 1, 2)
+
+
+# END: update cursor

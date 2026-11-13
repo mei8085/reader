@@ -11,6 +11,18 @@ Version 3.28
 
 Unreleased
 
+* Add optional persistent update progress cursor.
+
+  When ``use_update_cursor`` is passed to
+  :meth:`~Reader.update_feeds`, :meth:`~Reader.update_feeds_iter`,
+  or :meth:`~Reader.update_feed`,
+  new entries and the progress cursor are written in the same transaction,
+  so retrying an interrupted update
+  neither duplicates stored entries nor skips unstored ones,
+  and concurrent or not-modified updates of the same feed
+  do not overwrite newer progress with older results.
+  Existing update calls are unchanged.
+
 
 Version 3.27
 ------------

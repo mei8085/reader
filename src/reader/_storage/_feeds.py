@@ -13,12 +13,14 @@ from typing import cast
 from typing import NewType
 from typing import TYPE_CHECKING
 
+from .._logging import get_logger
 from .._types import FeedFilter
 from .._types import FeedForUpdate
 from .._types import FeedToUpdate
 from .._types import FeedUpdateIntent
 from .._types import Redirect
 from .._types import RetrieveMetadata
+from .._types import UpdateCursor
 from .._types import UpdateInfo
 from .._utils import exactly_one
 from .._utils import zero_or_one
@@ -43,6 +45,9 @@ if TYPE_CHECKING:
     from ._base import StorageBase
 else:
     StorageBase = object
+
+
+log = get_logger('reader.storage')
 
 
 FeedDict = NewType('FeedDict', Mapping[str, SQLiteValue])
@@ -98,7 +103,8 @@ class FeedsMixin(StorageBase):
                     update_after = NULL,
                     last_retrieved = NULL,
                     last_updated = NULL,
-                    last_exception = NULL
+                    last_exception = NULL,
+                    update_cursor = NULL
                 WHERE url = ?;
                 """,
                 (new,),
@@ -203,6 +209,43 @@ class FeedsMixin(StorageBase):
 
     def update_feed(self, intent: FeedUpdateIntent) -> None:
         return self.update_feed_dict(feed_update_intent_to_dict(intent))
+
+    @wrap_exceptions()
+    def update_feed_and_clear_update_cursor(self, intent: FeedUpdateIntent) -> None:
+        """Like update_feed(), but also clear the feed's update cursor,
+        in the same transaction.
+
+        The update is only applied if it does not overwrite the progress
+        of a newer update: one that already set a later last_retrieved,
+        or one that left a newer update cursor.
+
+        """
+        intent_dict = dict(feed_update_intent_to_dict(intent))
+
+        expressions = [f"{n} = :{n}" for n in intent_dict if n != 'url']
+        query = f"""
+            UPDATE feeds
+            SET {', '.join(expressions)}, update_cursor = NULL
+            WHERE url = :url
+                AND (last_retrieved IS NULL OR last_retrieved <= :last_retrieved)
+                AND (
+                    update_cursor IS NULL
+                    OR json_extract(update_cursor, '$.retrieved') <= :last_retrieved
+                );
+        """
+
+        with self.get_db() as db:
+            cursor = db.execute(query, intent_dict)
+            if cursor.rowcount:
+                return
+
+            url = intent_dict['url']
+            assert isinstance(url, str)
+            exists = db.execute("SELECT 1 FROM feeds WHERE url = ?;", (url,)).fetchone()
+            if not exists:
+                raise FeedNotFoundError(url)
+
+            log.debug("feed update lost to a newer update, skipping", feed=url)
 
     @wrap_exceptions()
     def update_feed_dict(self, intent: FeedDict) -> None:
@@ -319,7 +362,9 @@ def feed_filter(query: Query, filter: FeedFilter) -> dict[str, Any]:
 
 
 def feed_update_intent_to_dict(intent: FeedUpdateIntent) -> FeedDict:
-    url, _, _, update_history, value = intent
+    url = intent.url
+    update_history = intent.update_history
+    value = intent.value
 
     context: dict[str, Any] = {
         'url': url,
@@ -375,6 +420,7 @@ def get_feeds_for_update_query(filter: FeedFilter) -> tuple[Query, dict[str, Any
             ('last_exception', 'last_exception IS NOT NULL'),
             'update_history',
             'data_hash',
+            'update_cursor',
         )
         .FROM("feeds")
         .scrolling_window_order_by("url")
@@ -393,6 +439,7 @@ def feed_for_update_factory(row: tuple[Any, ...]) -> FeedForUpdate:
         last_exception,
         update_history,
         data_hash,
+        update_cursor,
     ) = row
     return FeedForUpdate(
         url,
@@ -407,6 +454,53 @@ def feed_for_update_factory(row: tuple[Any, ...]) -> FeedForUpdate:
             else []
         ),
         data_hash,
+        update_cursor_from_json(update_cursor) if update_cursor else None,
+    )
+
+
+def update_cursor_to_json(cursor: UpdateCursor) -> str:
+    return json.dumps(
+        {
+            'retrieved': adapt_datetime(cursor.retrieved),
+            'token': cursor.token.hex(),
+            'feed_order': cursor.feed_order,
+        }
+    )
+
+
+def update_cursor_from_json(data: str) -> UpdateCursor:
+    d = json.loads(data)
+    return UpdateCursor(
+        convert_timestamp(d['retrieved']),
+        bytes.fromhex(d['token']),
+        d['feed_order'],
+    )
+
+
+def set_feed_update_cursor(
+    db: sqlite3.Connection, url: str, cursor: UpdateCursor
+) -> None:
+    """Set a feed's update cursor on an existing connection.
+
+    Only applied if the cursor does not overwrite the progress
+    of a newer update (one with a later retrieved).
+
+    """
+    db.execute(
+        """
+        UPDATE feeds
+        SET update_cursor = :update_cursor
+        WHERE url = :url
+            AND (
+                update_cursor IS NULL
+                OR json_extract(update_cursor, '$.retrieved') <= :retrieved
+            );
+        """,
+        dict(
+            url=url,
+            update_cursor=update_cursor_to_json(cursor),
+            retrieved=adapt_datetime(cursor.retrieved),
+        ),
     )
 
 

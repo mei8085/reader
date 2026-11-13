@@ -797,6 +797,7 @@ class Reader:
         new: bool | None = None,
         scheduled: bool = True,
         workers: int = 1,
+        use_update_cursor: bool = False,
     ) -> None:
         r"""Update all or some of the feeds.
 
@@ -826,6 +827,13 @@ class Reader:
                 Only update feeds scheduled to be updated.
                 Defaults to true.
             workers (int): Number of threads to use when getting the feeds.
+            use_update_cursor (bool):
+                Persist a progress cursor while updating,
+                so that retrying an interrupted update
+                does not duplicate stored entries nor skip unstored ones,
+                and so that concurrent updates of the same feed
+                do not overwrite newer progress with older results.
+                Defaults to false (keep the original behavior).
 
         Raises:
             UpdateHookError: For unexpected hook exceptions.
@@ -878,6 +886,9 @@ class Reader:
         .. versionchanged:: 3.21
             Only update scheduled feeds by default.
 
+        .. versionadded:: 3.28
+            The ``use_update_cursor`` keyword argument.
+
         """
         with HookErrorGrouper("some hooks failed") as grouper:
             results = self.update_feeds_iter(
@@ -888,6 +899,7 @@ class Reader:
                 new=new,
                 scheduled=scheduled,
                 workers=workers,
+                use_update_cursor=use_update_cursor,
             )
 
             for url, value in results:
@@ -910,6 +922,7 @@ class Reader:
         new: bool | None = None,
         scheduled: bool = True,
         workers: int = 1,
+        use_update_cursor: bool = False,
         _call_feeds_hooks: bool = True,
     ) -> Iterable[UpdateResult]:
         r"""Update all or some of the feeds.
@@ -938,6 +951,9 @@ class Reader:
                 Only update feeds scheduled to be updated.
                 Defaults to true.
             workers (int): Number of threads to use when getting the feeds.
+            use_update_cursor (bool):
+                Persist a progress cursor while updating.
+                See :meth:`update_feeds` for details.
 
         Yields:
             :class:`UpdateResult`:
@@ -1003,6 +1019,9 @@ class Reader:
         .. versionchanged:: 3.21
             Only update scheduled feeds by default.
 
+        .. versionadded:: 3.28
+            The ``use_update_cursor`` keyword argument.
+
         """
         now = self._now()
 
@@ -1013,10 +1032,14 @@ class Reader:
             now, feed, tags, broken, updates_enabled, new, scheduled
         )
 
-        pipeline = self._make_pipeline(self, now, workers, _call_feeds_hooks)
+        pipeline = self._make_pipeline(
+            self, now, workers, _call_feeds_hooks, use_update_cursor
+        )
         yield from pipeline.update(filter)
 
-    def update_feed(self, feed: FeedInput, /) -> UpdatedFeed | None:
+    def update_feed(
+        self, feed: FeedInput, /, *, use_update_cursor: bool = False
+    ) -> UpdatedFeed | None:
         r"""Update a single feed.
 
         The feed will be updated even if updates are disabled for it,
@@ -1027,6 +1050,9 @@ class Reader:
 
         Args:
             feed (str or tuple(str) or Feed): The feed URL.
+            use_update_cursor (bool):
+                Persist a progress cursor while updating.
+                See :meth:`update_feeds` for details.
 
         Returns:
             UpdatedFeed or None:
@@ -1058,12 +1084,16 @@ class Reader:
             Document this method can raise :exc:`UpdateError`\s
             (other than :exc:`ParseError` and :exc:`UpdateHookError`).
 
+        .. versionadded:: 3.28
+            The ``use_update_cursor`` keyword argument.
+
         """
         _, rv = zero_or_one(
             self.update_feeds_iter(
                 feed=feed,
                 updates_enabled=None,
                 scheduled=False,
+                use_update_cursor=use_update_cursor,
                 _call_feeds_hooks=False,
             ),
             lambda: FeedNotFoundError(_feed_argument(feed)),

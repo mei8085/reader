@@ -285,6 +285,28 @@ def _getattr_entry_added_by(obj: object, name: str) -> EntryAddedBy:
     return cast(EntryAddedBy, value)
 
 
+class UpdateCursor(NamedTuple):
+    """Persistent progress of an interrupted feed update.
+
+    Stored in the same transaction as the entries written during an update,
+    so that a retried update can skip the entries that are already stored
+    without skipping those that are not.
+
+    """
+
+    #: Identifies the update run that wrote the cursor
+    #: (the :attr:`FeedUpdateIntent.last_retrieved` of that run).
+    retrieved: datetime
+
+    #: Token identifying the parsed feed and entry stream
+    #: the cursor refers to.
+    token: bytes
+
+    #: The index in the feed of the last stored entry
+    #: (entries are stored in decreasing feed order).
+    feed_order: int
+
+
 class FeedForUpdate(NamedTuple):
     """Update-relevant information about an existing feed, from Storage."""
 
@@ -312,6 +334,9 @@ class FeedForUpdate(NamedTuple):
 
     #: The :attr:`~FeedData.hash` of the corresponding FeedData.
     hash: bytes | None = None
+
+    #: The progress cursor of an interrupted update, if any.
+    update_cursor: UpdateCursor | None = None
 
 
 @dataclass(frozen=True)
@@ -402,6 +427,11 @@ class FeedUpdateIntent(NamedTuple):
     #: None (the feed is unchanged)
     #: the cause of :exc:`.UpdateError`, if one happened.
     value: FeedToUpdate | None | ExceptionInfo
+
+    #: Token identifying the parsed feed and entry stream;
+    #: used to persist update progress cursors.
+    #: None when the update cursor feature is not enabled.
+    update_token: bytes | None = None
 
 
 class FeedToUpdate(NamedTuple):
@@ -767,13 +797,19 @@ class StorageType(Protocol):
     update
         :meth:`get_feeds_for_update`
         :meth:`update_feed`
+        :meth:`update_feed_and_clear_update_cursor`
         :meth:`set_feed_stale`
         :meth:`get_entries_for_update`
         :meth:`add_or_update_entries`
+        :meth:`add_or_update_entries_with_cursor`
         :meth:`get_entry_recent_sort`
         :meth:`set_entry_recent_sort`
 
     """
+
+    #: The preferred number of entries to write in a single transaction;
+    #: 0 means no paging. Used by update logic.
+    chunk_size: int
 
     def __enter__(self) -> Self:
         """Called when :class:`.Reader` is used as a context manager."""
@@ -1088,6 +1124,21 @@ class StorageType(Protocol):
 
         """
 
+    def update_feed_and_clear_update_cursor(self, intent: FeedUpdateIntent, /) -> None:
+        """Called by update logic when the update cursor feature is enabled.
+
+        Like :meth:`update_feed`, but also clear the feed's update cursor,
+        in the same transaction; only applied if it does not overwrite
+        the progress of a newer update.
+
+        Args:
+            intent
+
+        Raises:
+            FeedNotFoundError
+
+        """
+
     def set_feed_stale(self, url: str, stale: bool, /) -> None:
         """Used by update logic tests.
 
@@ -1119,6 +1170,24 @@ class StorageType(Protocol):
 
         Args:
             intents
+
+        Raises:
+            FeedNotFoundError
+
+        """
+
+    def add_or_update_entries_with_cursor(
+        self, intents: Iterable[EntryUpdateIntent], url: str, cursor: UpdateCursor, /
+    ) -> None:
+        """Called by update logic when the update cursor feature is enabled.
+
+        Add or update entries and advance the feed's update cursor,
+        in the same transaction.
+
+        Args:
+            intents
+            url: The feed URL.
+            cursor
 
         Raises:
             FeedNotFoundError

@@ -27,6 +27,7 @@ from reader._types import EntryUpdateIntent
 from reader._types import FeedData
 from reader._types import FeedToUpdate
 from reader._types import FeedUpdateIntent
+from reader._types import UpdateCursor
 from utils import Blocking
 from utils import rename_argument
 from utils import utc_datetime as datetime
@@ -233,6 +234,18 @@ def update_feed(storage, feed, entry):
     )
 
 
+def update_feed_and_clear_update_cursor(storage, feed, entry):
+    storage.update_feed_and_clear_update_cursor(
+        FeedUpdateIntent(
+            feed.url,
+            datetime(2010, 1, 1),
+            datetime(2010, 1, 1),
+            [],
+            FeedToUpdate(feed, entry.updated),
+        )
+    )
+
+
 def add_or_update_entry(storage, feed, entry):
     storage.add_or_update_entry(
         EntryUpdateIntent(
@@ -256,6 +269,22 @@ def add_or_update_entries(storage, feed, entry):
                 datetime(2010, 1, 1),
             )
         ]
+    )
+
+
+def add_or_update_entries_with_cursor(storage, feed, entry):
+    storage.add_or_update_entries_with_cursor(
+        [
+            EntryUpdateIntent(
+                entry,
+                entry.updated,
+                datetime(2010, 1, 1),
+                datetime(2010, 1, 1),
+                datetime(2010, 1, 1),
+            )
+        ],
+        feed.url,
+        UpdateCursor(datetime(2010, 1, 1), b'token', 0),
     )
 
 
@@ -317,8 +346,10 @@ def get_entry_counts(storage, _, __):
         get_entry_recent_sort,
         set_entry_recent_sort,
         update_feed,
+        update_feed_and_clear_update_cursor,
         add_or_update_entry,
         add_or_update_entries,
+        add_or_update_entries_with_cursor,
         add_entry,
         delete_entries,
         get_entries,
@@ -386,6 +417,88 @@ def check_errors_locked(db_path, pre_stuff, do_stuff, exc_type):
 
 def iter_get_feeds(storage):
     return storage.get_feeds()
+
+
+def test_update_feed_and_clear_update_cursor(storage):
+    from reader._storage._feeds import set_feed_update_cursor
+
+    feed = FeedData('one', datetime(2010, 1, 1))
+    storage.add_feed(feed.url, datetime(2010, 1, 1))
+
+    def intent(last_retrieved):
+        return FeedUpdateIntent(feed.url, last_retrieved, last_retrieved, [], None)
+
+    def get_feed():
+        (feed,) = storage.get_feeds()
+        return feed
+
+    def get_cursor():
+        (feed_for_update,) = storage.get_feeds_for_update()
+        return feed_for_update.update_cursor
+
+    # the update is applied, and clears the cursor
+    cursor = UpdateCursor(datetime(2010, 1, 1), b'token', 0)
+    set_feed_update_cursor(storage.get_db(), feed.url, cursor)
+    assert get_cursor() == cursor
+
+    storage.update_feed_and_clear_update_cursor(intent(datetime(2010, 1, 2)))
+    assert get_feed().last_retrieved == datetime(2010, 1, 2)
+    assert get_cursor() is None
+
+    # an older update does not overwrite newer progress
+    storage.update_feed_and_clear_update_cursor(intent(datetime(2010, 1, 1)))
+    assert get_feed().last_retrieved == datetime(2010, 1, 2)
+
+    # a newer update does
+    storage.update_feed_and_clear_update_cursor(intent(datetime(2010, 1, 3)))
+    assert get_feed().last_retrieved == datetime(2010, 1, 3)
+
+    # an update does not clear the cursor of a newer in-progress update
+    newer_cursor = UpdateCursor(datetime(2010, 1, 4), b'token', 1)
+    set_feed_update_cursor(storage.get_db(), feed.url, newer_cursor)
+    storage.update_feed_and_clear_update_cursor(intent(datetime(2010, 1, 3, 1)))
+    assert get_cursor() == newer_cursor
+
+    # ... but the newer update itself does
+    storage.update_feed_and_clear_update_cursor(intent(datetime(2010, 1, 4)))
+    assert get_feed().last_retrieved == datetime(2010, 1, 4)
+    assert get_cursor() is None
+
+    # a missing feed raises
+    with pytest.raises(FeedNotFoundError):
+        storage.update_feed_and_clear_update_cursor(
+            FeedUpdateIntent(
+                'two', datetime(2010, 1, 1), datetime(2010, 1, 1), [], None
+            )
+        )
+
+
+def test_set_feed_update_cursor(storage):
+    from reader._storage._feeds import set_feed_update_cursor
+
+    feed = FeedData('one', datetime(2010, 1, 1))
+    storage.add_feed(feed.url, datetime(2010, 1, 1))
+
+    def get_cursor():
+        (feed_for_update,) = storage.get_feeds_for_update()
+        return feed_for_update.update_cursor
+
+    assert get_cursor() is None
+
+    cursor = UpdateCursor(datetime(2010, 1, 2), b'one', 0)
+    set_feed_update_cursor(storage.get_db(), feed.url, cursor)
+    assert get_cursor() == cursor
+
+    # an older cursor does not overwrite a newer one
+    set_feed_update_cursor(
+        storage.get_db(), feed.url, UpdateCursor(datetime(2010, 1, 1), b'two', 1)
+    )
+    assert get_cursor() == cursor
+
+    # a newer one does
+    newer_cursor = UpdateCursor(datetime(2010, 1, 3), b'two', 1)
+    set_feed_update_cursor(storage.get_db(), feed.url, newer_cursor)
+    assert get_cursor() == newer_cursor
 
 
 def iter_get_feeds_for_update(storage):
